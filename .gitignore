@@ -1,0 +1,25 @@
+# Generated files
+__pycache__/
+*.py[cod]
+*.pyo
+.cache/
+
+# Model binaries (regenerate with build_model.py + quantize script)
+*.onnx
+*.rknn
+*.pt
+*.pth
+*.weights
+
+# Training outputs
+runs/
+wandb/
+
+# Dataset caches
+*.cache
+datasets/
+
+# IDE
+.vscode/
+.idea/
+*.swp

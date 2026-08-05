@@ -1,0 +1,90 @@
+# SDD-YOLO: Small-Target Detection YOLO for Ground-to-Air Anti-UAV Surveillance
+# Paper: arXiv:2603.25218v1
+#
+# Modifications vs YOLO26n:
+#   ① P2 high-resolution detection head (4× downsampling, Stride 4)
+#      → for sub-16px UAV targets: 8px target = 2×2 feature response (vs 1×1 at P3)
+#   ② DualAttention at P2/P3/P4 outputs (CBAM-style, NO Softmax → RKNN NPU-friendly)
+#      → suppresses aerial clutter: birds, clouds, building edges
+#   ③ DFL-free: reg_max=1 (inherited from YOLO26, avoids Softmax in bbox regression)
+#   ④ NMS-free: end2end=True (O2O inference, no post-processing CPU bottleneck)
+#
+# Note: C2PSA is retained in backbone+neck for feature quality.
+#       On RKNN RK3588: causes 2 graph splits (+~1.7ms), acceptable tradeoff.
+#       Replace with C3k2 if strict latency is required.
+#
+# Training strategy (from paper, configure in train script):
+#   - MuSGD optimizer  (gradient orthogonalization via Newton-Schulz)
+#   - ProgLoss         (progressive loss re-weighting across epochs)
+#   - STAL             (Small-Target-Aware Label Assignment)
+#   - KD from YOLO26x teacher (optional, improves nano model accuracy)
+
+nc: 1      # number of classes (set to 1 for single-class UAV detection)
+end2end: True   # NMS-free O2O inference
+reg_max: 1      # DFL-free (1 bin = direct WIoU regression)
+
+scales:
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00,  512]
+  l: [1.00, 1.00,  512]
+  x: [1.00, 1.50,  512]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backbone  (identical to YOLO26n — CSP + SPPF + C2PSA)
+# ─────────────────────────────────────────────────────────────────────────────
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv,  [64, 3, 2]]            #  0  P1/2   stride=2
+  - [-1, 1, Conv,  [128, 3, 2]]           #  1  P2/4   stride=4
+  - [-1, 2, C3k2,  [256, False, 0.25]]    #  2  P2 features  (← P2 FPN source)
+  - [-1, 1, Conv,  [256, 3, 2]]           #  3  stride=8
+  - [-1, 2, C3k2,  [512, False, 0.25]]    #  4  P3 features  (← P3 FPN source)
+  - [-1, 1, Conv,  [512, 3, 2]]           #  5  stride=16
+  - [-1, 2, C3k2,  [512, True]]           #  6  P4 features  (← P4 FPN source)
+  - [-1, 1, Conv,  [1024, 3, 2]]          #  7  stride=32
+  - [-1, 2, C3k2,  [1024, True]]          #  8
+  - [-1, 1, SPPF,  [1024, 5, 3, True]]   #  9
+  - [-1, 2, C2PSA, [1024]]               # 10  P5 (global context via MHSA)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Head  (P2-augmented PAN + DualAttention before each Detect output)
+# ─────────────────────────────────────────────────────────────────────────────
+head:
+  # ── Top-Down FPN (P5→P4→P3→P2) ────────────────────────────────────────────
+  - [-1,    1, nn.Upsample, [None, 2, "nearest"]]  # 11  P5 → P4 scale
+  - [[-1, 6], 1, Concat,    [1]]                   # 12  cat backbone P4
+  - [-1,    2, C3k2,        [512, True]]            # 13  P4-TD
+
+  - [-1,    1, nn.Upsample, [None, 2, "nearest"]]  # 14  P4 → P3 scale
+  - [[-1, 4], 1, Concat,    [1]]                   # 15  cat backbone P3
+  - [-1,    2, C3k2,        [256, True]]            # 16  P3-TD
+
+  - [-1,    1, nn.Upsample, [None, 2, "nearest"]]  # 17  P3 → P2 scale
+  - [[-1, 2], 1, Concat,    [1]]                   # 18  cat backbone P2 (high-res)
+  - [-1,    2, C3k2,        [128, True]]            # 19  P2-TD  ← NEW P2 branch
+
+  # ── Bottom-Up PAN (P2→P3→P4→P5) ────────────────────────────────────────────
+  - [-1,     1, Conv,  [128, 3, 2]]                # 20  P2 → P3 scale
+  - [[-1, 16], 1, Concat, [1]]                     # 21  cat P3-TD
+  - [-1,     2, C3k2,  [256, True]]                # 22  P3-BU (final P3 feature)
+
+  - [-1,     1, Conv,  [256, 3, 2]]                # 23  P3 → P4 scale
+  - [[-1, 13], 1, Concat, [1]]                     # 24  cat P4-TD
+  - [-1,     2, C3k2,  [512, True]]                # 25  P4-BU (final P4 feature)
+
+  - [-1,     1, Conv,  [512, 3, 2]]                # 26  P4 → P5 scale
+  - [[-1, 10], 1, Concat, [1]]                     # 27  cat C2PSA output
+  - [-1,     1, C3k2,  [1024, True, 0.5, True]]   # 28  P5-BU (with internal attn)
+
+  # ── DualAttention (domain-specific clutter suppression, RKNN-friendly) ──────
+  # Applied to P2/P3/P4 before detection heads.
+  # args=[] → channels auto-detected on first forward (avoids scale-mismatch)
+  # P5 skipped: C3k2 layer 28 already includes internal attention.
+  - [19, 1, DualAttention, []]                     # 29  DA on P2 output
+  - [22, 1, DualAttention, []]                     # 30  DA on P3 output
+  - [25, 1, DualAttention, []]                     # 31  DA on P4 output
+
+  # ── Detection Heads: P2/P3/P4/P5 ──────────────────────────────────────────
+  - [[29, 30, 31, 28], 1, Detect, [nc]]            # 32  4-scale end-to-end detect
