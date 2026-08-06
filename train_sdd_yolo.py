@@ -32,80 +32,18 @@ import sys
 import os
 import argparse
 
-sys.path.insert(0, os.path.dirname(__file__))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
-# ── Register DualAttention BEFORE any Ultralytics import that parses YAML ──
-from dual_attention import DualAttention
-import ultralytics.nn.modules as _m
-import ultralytics.nn.tasks  as _t
-setattr(_m, 'DualAttention', DualAttention)
-_t.__dict__['DualAttention'] = DualAttention
+# ── Register DualAttention and import trainer from its own module ──────────
+# SDD_YOLOTrainer must live in sdd_yolo_trainer.py (not __main__) so that
+# Ultralytics DDP workers can do `from sdd_yolo_trainer import SDD_YOLOTrainer`
+# instead of `from __main__ import SDD_YOLOTrainer` (which fails in workers).
+from sdd_yolo_trainer import SDD_YOLOTrainer  # also registers DualAttention
 
 import torch
 from ultralytics import YOLO
-from ultralytics.models.yolo.detect import DetectionTrainer
-
-from musgd import MuSGD, build_musgd_param_groups
-
-
-# ────────────────────────────────────────────────────────────────────────────
-class SDD_YOLOTrainer(DetectionTrainer):
-    """Custom Ultralytics trainer that injects MuSGD when requested.
-
-    All standard Ultralytics features (logging, callbacks, AMP, mosaic,
-    val metrics, model checkpointing) are preserved — only the optimizer
-    construction is overridden.
-    """
-
-    def build_optimizer(self, model, name="auto", lr=0.01, momentum=0.95,
-                        decay=0.0005, iterations=None):
-        """Build optimizer.  MuSGD when name='musgd'; delegates otherwise."""
-
-        opt_name = (name or "auto").lower()
-
-        if opt_name != "musgd":
-            # Fall back to Ultralytics built-in (AdamW / SGD / auto)
-            return super().build_optimizer(
-                model, name=name, lr=lr, momentum=momentum,
-                decay=decay, iterations=iterations,
-            )
-
-        # ── MuSGD construction ────────────────────────────────────────────
-        self.console.info(
-            "\n── Building MuSGD optimizer ──\n"
-            "  backbone matrices (0-10): Newton-Schulz orthogonalized SGD\n"
-            "  backbone vectors (bias/BN): Nesterov SGD\n"
-            "  neck + head: Nesterov SGD\n"
-        )
-
-        param_groups = build_musgd_param_groups(
-            model,
-            backbone_layers = 10,
-            matrix_lr    = lr,           # backbone matrix LR  (from hyp)
-            vector_lr    = lr * 0.1,     # backbone bias/BN    (10× smaller)
-            neck_head_lr = lr,           # neck + P2 + head    (same as backbone)
-            weight_decay = decay,
-            momentum     = momentum,
-            ns_steps     = 5,
-        )
-
-        # Report param counts per group
-        for pg in param_groups:
-            n = sum(p.numel() for p in pg["params"])
-            self.console.info(
-                f"  {pg['label']:20s}  {len(pg['params']):4d} tensors"
-                f"  {n/1e6:.2f}M params  lr={pg['lr']:.2e}"
-                f"  NS={'ON ' if pg['use_ns'] else 'OFF'}"
-            )
-
-        optimizer = MuSGD(param_groups, lr=lr, momentum=momentum,
-                          weight_decay=decay)
-
-        self.console.info(
-            f"\n  Total optimisable params: "
-            f"{sum(p.numel() for g in param_groups for p in g['params'])/1e6:.2f} M\n"
-        )
-        return optimizer
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -117,7 +55,7 @@ def load_pretrained_weights(model: YOLO, pretrained_path: str) -> tuple[int, int
     """
     print(f'\n── Loading pretrained weights from: {pretrained_path}')
 
-    ckpt = torch.load(pretrained_path, map_location='cpu')
+    ckpt = torch.load(pretrained_path, map_location='cpu', weights_only=False)
     model_obj = ckpt.get('model', ckpt)
     if hasattr(model_obj, 'state_dict'):
         src_sd = model_obj.float().state_dict()
@@ -175,6 +113,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--name',      default='exp')
     ap.add_argument('--resume',    default=None,
                     help='resume from a previous SDD-YOLO checkpoint')
+    ap.add_argument('--lr0',       type=float, default=0.001,
+                    help='initial LR (default 0.001 for stage-1; use 0.01 for stage-2 with NS active)')
     ap.add_argument('--teacher',   default=None,
                     help='YOLO26x .pt for knowledge distillation (optional)')
     return ap.parse_args()
@@ -215,11 +155,16 @@ def main() -> None:
         # Optimizer selection — handled by SDD_YOLOTrainer.build_optimizer()
         optimizer    = args.optimizer.upper() if args.optimizer != 'musgd'
                        else 'MuSGD',
-        lr0          = 0.01,
+        # lr0: stage-1 default=0.001 (backbone frozen, NS disabled on neck/head,
+        #   momentum=0.95 gives ~20× effective scale → 0.001 is safe).
+        #   stage-2: pass --lr0 0.01 (backbone unfrozen, NS active on matrices,
+        #   Newton-Schulz normalises updates so 0.01 is safe).
+        lr0          = args.lr0,
         lrf          = 0.01,
         momentum     = 0.95,
         weight_decay = 0.0005,
         warmup_epochs = 3.0,
+        warmup_bias_lr = args.lr0,  # must match lr0 so bias doesn't overshoot
 
         # Loss weights (paper Section 4.3)
         dfl          = 0.0,    # DFL-free training (reg_max=1)

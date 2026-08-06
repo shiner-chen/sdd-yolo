@@ -23,3 +23,6 @@ datasets/
 .vscode/
 .idea/
 *.swp
+
+# Runtime logs
+*.log
