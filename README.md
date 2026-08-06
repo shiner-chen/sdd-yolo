@@ -248,12 +248,105 @@ To further reduce latency: replace C2PSA with C3k2 in the YAML (~−1.7ms, ~−1
 
 ---
 
+## Quantization-Aware Training (QAT)
+
+Standard INT8 PTQ compresses all high-confidence scores into a single quantization
+bucket, producing discrete outputs (all detections get the same score ≈ 1.29).
+QAT fixes this by training with fake quantization so the model learns to maintain
+continuous, discriminative confidence scores even after INT8 conversion.
+
+### How it works
+
+```
+best.pt (FP32)
+  │
+  ├─ insert FakeQuantize hooks (simulates RKNN INT8 rounding during forward pass)
+  │    • Activation: per-tensor symmetric INT8  (matches RKNN default)
+  │    • Weights:    per-channel symmetric INT8 (matches RKNN channel-wise quant)
+  │    • Skipped:    C2PSA (Softmax, CPU-only on RKNN — no benefit from QAT)
+  │
+  ├─ Epoch 1-2  (calibration): observer ON, fake_quant OFF
+  │    → measure per-layer activation ranges without disturbing training
+  │
+  ├─ Epoch 3-20 (QAT active):  observer ON, fake_quant ON
+  │    → model trains with INT8 rounding noise → learns to spread confidence scores
+  │
+  └─ Export as FP32 ONNX  →  RKNN-Toolkit2 INT8 PTQ
+       QAT-regularized activations make RKNN's subsequent PTQ much more accurate
+```
+
+Expected improvement vs plain INT8 PTQ:
+
+| Metric | INT8 PTQ | After QAT + PTQ |
+|--------|---------|----------------|
+| Score distribution | 1 discrete value (1.29) | continuous [0, 1] |
+| mAP@0.5 | ~17% | ~35–45% (estimated) |
+| Latency | unchanged | unchanged (~13ms) |
+
+### Code structure (`qat_sdd_yolo.py`)
+
+```python
+make_act_fq()              # per-tensor symmetric INT8 FakeQuantize (activations)
+make_wt_fq()               # per-channel symmetric INT8 FakeQuantize (weights)
+
+QATHooks                   # manages all FakeQuantize forward hooks
+  .attach(model)           # insert hooks on all eligible Conv layers
+  .set_observer_enabled()  # control calibration phase
+  .set_fake_quant_enabled()# control quantization phase
+
+QATDetectionTrainer        # extends Ultralytics DetectionTrainer
+  ._setup_train()          # auto-injects QATHooks after model→device
+  .optimizer_step()        # enables fake_quant after calibration epochs
+
+export_qat_onnx(pt, imgsz) # QAT .pt → FP32 ONNX (end2end=False for RKNN)
+quantize_to_rknn(onnx, txt)# ONNX → RKNN INT8 via rknn-toolkit2 PTQ
+
+main() / argparse          # full 3-stage pipeline with CLI
+```
+
+### Usage
+
+**Full pipeline — train + export + RKNN INT8:**
+
+```bash
+python qat_sdd_yolo.py \
+    --pretrained /path/to/best.pt \
+    --data       your_uav_dataset.yaml \
+    --epochs     20 \
+    --lr         0.0001 \
+    --calib-data /path/to/calib500_fixed.txt \
+    --device     0
+```
+
+**Export only (skip training):**
+
+```bash
+python qat_sdd_yolo.py \
+    --pretrained runs/qat/exp/weights/best_qat.pt \
+    --export-only \
+    --calib-data /path/to/calib500_fixed.txt
+```
+
+**Key training notes:**
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| `--lr` | `1e-4` | ~1/100 of original LR — fine-tune, not re-train |
+| `--epochs` | `20` | 2 calibration + 18 QAT-active epochs |
+| `amp` | disabled | FakeQuantize STE gradient unstable in fp16 |
+| `mosaic` | `0.5` | reduced — avoid disturbing fine-tune convergence |
+| `dfl` | `0.0` | inherited from SDD-YOLO (reg_max=1) |
+| `qat_calibration_epochs` | `2` | observer-only phase before fake_quant enabled |
+
+---
+
 ## File Structure
 
 ```
 sdd_yolo/
 ├── dual_attention.py      # DualAttention module (RKNN-friendly CBAM variant)
 ├── musgd.py               # MuSGD optimizer (Newton-Schulz gradient orthogonalization)
+├── qat_sdd_yolo.py        # QAT fine-tuning script (INT8 score discretization fix)
 ├── sdd_yolo_n.yaml        # nc=80 architecture (all model scales n/s/m/l/x)
 ├── sdd_yolo_nc1.yaml      # nc=1 single-class Anti-UAV variant
 ├── build_model.py         # Architecture verification script
